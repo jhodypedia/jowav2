@@ -33,7 +33,6 @@ export async function verifyApiKey(req, res, next) {
   }
 }
 
-// ✅ Middleware khusus Admin
 export function verifyAdmin(req, res, next) {
   if (req.user.role !== "admin") {
     return res.status(403).json({ error: "Access denied. Admin only." });
