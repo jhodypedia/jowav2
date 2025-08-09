@@ -7,6 +7,7 @@ const User = sequelize.define("User", {
   phone: { type: DataTypes.STRING, allowNull: false, unique: true },
   password: { type: DataTypes.STRING, allowNull: false },
   apiKey: { type: DataTypes.STRING, allowNull: false, unique: true },
+  role: { type: DataTypes.ENUM("admin", "user"), defaultValue: "user" }, // ✅ Role baru
   premium: { type: DataTypes.BOOLEAN, defaultValue: false },
   premiumUntil: { type: DataTypes.DATE, allowNull: true },
   resetToken: { type: DataTypes.STRING, allowNull: true },
