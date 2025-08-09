@@ -9,14 +9,26 @@ import { sendMail } from "../config/mailer.js";
 dotenv.config();
 const SECRET = process.env.JWT_SECRET || "changemejwtsecret";
 
+/**
+ * Helper to safely get body params
+ */
+function getBody(req) {
+  if (req.body && typeof req.body === "object") return req.body;
+  try {
+    return JSON.parse(req.body); // for raw text body
+  } catch {
+    return {};
+  }
+}
+
+// REGISTER
 export async function register(req, res) {
   try {
-    const { username, email, phone, password } = req.body;
+    const { username, email, phone, password } = getBody(req);
     if (!username || !email || !password) {
       return res.status(400).json({ error: "username, email, password required" });
     }
 
-    // unique check
     const existEmail = await User.findOne({ where: { email } });
     if (existEmail) return res.status(409).json({ error: "Email already registered" });
 
@@ -47,9 +59,12 @@ export async function register(req, res) {
   }
 }
 
+// LOGIN
 export async function login(req, res) {
   try {
-    const { email, password } = req.body;
+    console.log("📥 Body received:", req.body);
+
+    const { email, password } = getBody(req);
     if (!email || !password) return res.status(400).json({ error: "email & password required" });
 
     const user = await User.findOne({ where: { email } });
@@ -73,9 +88,10 @@ export async function login(req, res) {
   }
 }
 
+// FORGOT PASSWORD
 export async function forgotPassword(req, res) {
   try {
-    const { email } = req.body;
+    const { email } = getBody(req);
     if (!email) return res.status(400).json({ error: "email required" });
 
     const user = await User.findOne({ where: { email } });
@@ -101,9 +117,10 @@ export async function forgotPassword(req, res) {
   }
 }
 
+// RESET PASSWORD
 export async function resetPassword(req, res) {
   try {
-    const { token, password } = req.body;
+    const { token, password } = getBody(req);
     if (!token || !password) return res.status(400).json({ error: "token & password required" });
 
     const user = await User.findOne({ where: { resetToken: token } });
@@ -125,9 +142,10 @@ export async function resetPassword(req, res) {
   }
 }
 
+// UPDATE PROFILE
 export async function updateProfile(req, res) {
   try {
-    const { username, phone, password } = req.body;
+    const { username, phone, password } = getBody(req);
     const user = await User.findByPk(req.user.id);
     if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -143,7 +161,7 @@ export async function updateProfile(req, res) {
   }
 }
 
-// Admin functions
+// GET ALL USERS (Admin)
 export async function getAllUsers(req, res) {
   try {
     const users = await User.findAll({
@@ -156,9 +174,10 @@ export async function getAllUsers(req, res) {
   }
 }
 
+// SET USER ROLE (Admin)
 export async function setUserRole(req, res) {
   try {
-    const { userId, role } = req.body;
+    const { userId, role } = getBody(req);
     if (!["admin", "user"].includes(role)) return res.status(400).json({ error: "Invalid role" });
 
     const user = await User.findByPk(userId);
@@ -173,9 +192,10 @@ export async function setUserRole(req, res) {
   }
 }
 
+// SET PREMIUM (Admin)
 export async function setPremium(req, res) {
   try {
-    const { userId, months = 1 } = req.body;
+    const { userId, months = 1 } = getBody(req);
     const user = await User.findByPk(userId);
     if (!user) return res.status(404).json({ error: "User not found" });
 
