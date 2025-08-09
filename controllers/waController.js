@@ -1,4 +1,5 @@
 // controllers/waController.js
+import express from "express";
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -8,15 +9,14 @@ import qrcode from "qrcode";
 import fs from "fs";
 import path from "path";
 import axios from "axios";
-import Log from "../models/Log.js";
 import User from "../models/User.js";
+import Log from "../models/Log.js";
 
 /**
- * WA Controller - full features
+ * WA Controller - Full features
  *
- * - Sessions kept in ./baileys/sessions/{apiKey}
- * - QR pushed to frontend via Server-Sent Events (SSE) on /wa/qr-stream
- * - All important events logged to Log model
+ * Mount this router under /api/wa (recommended) and protect routes with verifyApiKey
+ * Except /qr-stream which can accept ?apiKey=... without auth for EventSource clients.
  */
 
 /* ----------------------------
@@ -24,7 +24,7 @@ import User from "../models/User.js";
    ---------------------------- */
 const sessions = {};      // apiKey -> socket
 const reconnecting = {};  // apiKey -> boolean
-const sseClients = new Map(); // apiKey -> Set of res (SSE response objects)
+const sseClients = new Map(); // apiKey -> Set(res) for SSE
 
 /* ----------------------------
    Helpers
@@ -46,43 +46,38 @@ function sendSSE(apiKey, eventName, data) {
       res.write(`event: ${eventName}\n`);
       res.write(`data: ${payload}\n\n`);
     } catch (err) {
-      // ignore broken clients
+      // ignore
     }
   }
 }
 
-/* Convert QR string to PNG dataURL using 'qrcode' lib */
 async function qrStringToDataUrl(qrString) {
   try {
     const dataUrl = await qrcode.toDataURL(qrString, { errorCorrectionLevel: "M", type: "image/png" });
     return dataUrl;
   } catch (err) {
-    // fallback: return raw base64 of string (less useful)
     return `data:text/plain;base64,${Buffer.from(qrString).toString("base64")}`;
   }
 }
 
-/* Ensure session dir exists */
 function ensureSessionDir(apiKey) {
   const sessionPath = path.join("baileys", "sessions", apiKey);
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
   return sessionPath;
 }
 
-/* Create or reuse socket for `user` */
+/* ----------------------------
+   Create or reuse socket for a user
+   ---------------------------- */
 export async function createSocketForUser(user) {
   const apiKey = user.apiKey;
   if (sessions[apiKey]) return sessions[apiKey];
 
   ensureSessionDir(apiKey);
 
-  // get latest baileys version
+  // fetch latest Baileys version (best-effort)
   let versionInfo;
-  try {
-    versionInfo = await fetchLatestBaileysVersion();
-  } catch (err) {
-    versionInfo = { version: undefined, isLatest: false };
-  }
+  try { versionInfo = await fetchLatestBaileysVersion(); } catch (e) { versionInfo = { version: undefined }; }
 
   // create auth state
   const { state, saveCreds } = await useMultiFileAuthState(path.join("baileys", "sessions", apiKey));
@@ -103,9 +98,7 @@ export async function createSocketForUser(user) {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // convert to PNG dataUrl and send to SSE clients
         const dataUrl = await qrStringToDataUrl(qr);
-        // store minimal info to logs and push to client
         await saveLog(user.id, "qr_generated", { ts: new Date().toISOString() });
         sendSSE(apiKey, "qr", { qrDataUrl: dataUrl, ts: new Date().toISOString() });
       }
@@ -113,7 +106,6 @@ export async function createSocketForUser(user) {
       if (connection === "open") {
         sendSSE(apiKey, "connected", { ts: new Date().toISOString() });
         await saveLog(user.id, "connection_open", {});
-        // cleanup any old qr SSE payloads for fresh start
         sendSSE(apiKey, "qr_cleared", {});
       }
 
@@ -121,18 +113,16 @@ export async function createSocketForUser(user) {
         await saveLog(user.id, "connection_close", { lastDisconnect });
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         if (statusCode === DisconnectReason.loggedOut) {
-          // logged out -> cleanup session files and socket
+          // logged out -> remove session files and socket
           await saveLog(user.id, "logged_out", {});
           try {
             if (sessions[apiKey]) {
-              await sessions[apiKey].logout().catch(() => {});
+              await sessions[apiKey].logout().catch(()=>{});
               delete sessions[apiKey];
             }
             const sessDir = path.join("baileys", "sessions", apiKey);
             fs.rmSync(sessDir, { recursive: true, force: true });
-          } catch (e) {
-            console.error("cleanup error:", e);
-          }
+          } catch (e) { console.error("cleanup error:", e); }
           sendSSE(apiKey, "logged_out", {});
         } else {
           // try reconnect
@@ -143,7 +133,7 @@ export async function createSocketForUser(user) {
                 const freshUser = await User.findOne({ where: { apiKey } });
                 if (freshUser) await createSocketForUser(freshUser);
               } catch (e) {
-                console.error("reconnect attempt failed", e);
+                console.error("reconnect err:", e);
               } finally {
                 reconnecting[apiKey] = false;
               }
@@ -156,31 +146,30 @@ export async function createSocketForUser(user) {
     }
   });
 
-  // Save creds
   sock.ev.on("creds.update", saveCreds);
 
-  // messages.upsert handler
+  // incoming messages
   sock.ev.on("messages.upsert", async (m) => {
     try {
       await saveLog(user.id, "message_in", m);
-      // auto-mark read (optional behavior)
+      // push to SSE clients
+      sendSSE(apiKey, "message", { event: m });
+      // auto-read receipts for notify type
       if (m.type === "notify") {
-        const msgs = m.messages || [];
-        for (const msg of msgs) {
+        const messages = m.messages || [];
+        for (const msg of messages) {
           if (!msg.key || msg.key.remoteJid === "status@broadcast") continue;
           try {
             await sock.sendReadReceipt(msg.key.remoteJid, msg.key.participant ?? msg.key.remoteJid, [msg.key.id]);
-          } catch (e) { /* ignore */ }
+          } catch {}
         }
       }
-      // push incoming to SSE too
-      sendSSE(apiKey, "message", { event: m });
     } catch (err) {
       console.error("messages.upsert err:", err);
     }
   });
 
-  // other events logging
+  // other events -> log
   sock.ev.on("presence.update", (p) => saveLog(user.id, "presence_update", p).catch(()=>{}));
   sock.ev.on("chats.set", (c) => saveLog(user.id, "chats_set", c).catch(()=>{}));
   sock.ev.on("groups.update", (g) => saveLog(user.id, "groups_update", g).catch(()=>{}));
@@ -190,35 +179,36 @@ export async function createSocketForUser(user) {
 }
 
 /* ----------------------------
-   SSE endpoint: /wa/qr-stream
-   - Client must set header x-api-key or query ?apiKey=
-   - Keep connection open, send events:
-     event: qr -> { qrDataUrl, ts }
-     event: connected -> {}
-     event: message -> { event }
-     event: logged_out -> {}
- */
-export async function qrSSE(req, res) {
-  try {
-    const apiKey = req.headers["x-api-key"] || req.query.apiKey;
-    if (!apiKey) return res.status(401).json({ error: "x-api-key header or ?apiKey required" });
+   Router & handlers
+   ---------------------------- */
+const router = express.Router();
 
-    // set SSE headers
+/**
+ * SSE endpoint: GET /qr-stream?apiKey=...
+ * - Accepts query param apiKey for EventSource (browsers cannot send headers)
+ * - Also accepts if route mounted with verifyApiKey middleware (then uses req.user)
+ */
+router.get("/qr-stream", async (req, res) => {
+  try {
+    // allow either ?apiKey= or header-provided req.user (if middleware used)
+    const apiKey = req.query.apiKey || (req.user && req.user.apiKey) || req.headers["x-api-key"];
+    if (!apiKey) return res.status(401).json({ error: "apiKey query param or x-api-key required" });
+
+    // SSE headers
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
 
-    // add to sseClients
     if (!sseClients.has(apiKey)) sseClients.set(apiKey, new Set());
     sseClients.get(apiKey).add(res);
 
-    // heartbeat comment every 25s (some proxies close idle sse)
+    // heartbeat to keep connection alive
     const ping = setInterval(() => {
       try { res.write(":\n\n"); } catch (e) {}
     }, 25000);
 
-    // cleanup on close
+    // remove on close
     req.on("close", () => {
       clearInterval(ping);
       const setClients = sseClients.get(apiKey);
@@ -228,40 +218,38 @@ export async function qrSSE(req, res) {
       }
     });
 
-    // send initial ack
+    // initial ack
     res.write(`event: connected\n`);
     res.write(`data: ${JSON.stringify({ ts: new Date().toISOString() })}\n\n`);
   } catch (err) {
-    console.error("qrSSE err:", err);
+    console.error("qr-stream err:", err);
     try { res.status(500).json({ error: err.message }); } catch {}
   }
-}
-
-/* ----------------------------
-   REST endpoints
-   ---------------------------- */
+});
 
 /**
- * POST /wa/connect
- * header: x-api-key
- * -> starts socket for user (non-blocking). QR will be sent through SSE (if client connected).
+ * POST /connect
+ * Protected: expects req.user (verifyApiKey middleware)
+ * -> starts socket (non-blocking). QR will be delivered via SSE if client connected.
  */
-export async function connect(req, res) {
+router.post("/connect", async (req, res) => {
   try {
     const user = req.user;
-    // create or reuse
-    await createSocketForUser(user);
-    res.json({ success: true, message: "Socket initiating. Subscribe to /wa/qr-stream (SSE) to receive QR & events." });
+    if (!user) return res.status(401).json({ error: "Unauthorized" });
+    // reload full user instance if req.user contains only id/apiKey
+    const fullUser = await User.findByPk(user.id);
+    await createSocketForUser(fullUser);
+    res.json({ success: true, message: "Socket initiating. Subscribe to /qr-stream to receive QR & events." });
   } catch (err) {
     console.error("connect err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * GET /wa/status
+ * GET /status
  */
-export async function status(req, res) {
+router.get("/status", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -270,13 +258,13 @@ export async function status(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/send-text
+ * POST /send-text
  * body: { to, text }
  */
-export async function sendText(req, res) {
+router.post("/send-text", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -289,16 +277,16 @@ export async function sendText(req, res) {
     await saveLog(req.user.id, "message_out_text", { to, text });
     res.json({ success: true, result });
   } catch (err) {
-    console.error("sendText err:", err);
+    console.error("send-text err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/send-media
+ * POST /send-media
  * body: { to, url (optional), base64 (optional), filename (optional), caption (optional) }
  */
-export async function sendMedia(req, res) {
+router.post("/send-media", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -306,6 +294,7 @@ export async function sendMedia(req, res) {
 
     const { to, url, base64, filename = "file", caption } = req.body;
     if (!to) return res.status(400).json({ error: "to required" });
+
     let buffer;
     if (url) {
       const resp = await axios.get(url, { responseType: "arraybuffer" });
@@ -332,16 +321,16 @@ export async function sendMedia(req, res) {
     await saveLog(req.user.id, "message_out_media", { to, filename, caption });
     res.json({ success: true, result });
   } catch (err) {
-    console.error("sendMedia err:", err);
+    console.error("send-media err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/send-buttons
+ * POST /send-buttons
  * body: { to, text, footer, buttons }
  */
-export async function sendButtons(req, res) {
+router.post("/send-buttons", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -355,16 +344,16 @@ export async function sendButtons(req, res) {
     await saveLog(req.user.id, "message_out_buttons", { to, text, buttons });
     res.json({ success: true, result });
   } catch (err) {
-    console.error("sendButtons err:", err);
+    console.error("send-buttons err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/send-template
+ * POST /send-template
  * body: { to, text, footer, hydratedButtons }
  */
-export async function sendTemplate(req, res) {
+router.post("/send-template", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -378,16 +367,16 @@ export async function sendTemplate(req, res) {
     await saveLog(req.user.id, "message_out_template", { to, text });
     res.json({ success: true, result });
   } catch (err) {
-    console.error("sendTemplate err:", err);
+    console.error("send-template err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/broadcast
+ * POST /broadcast
  * body: { numbers: ["628xx@s.whatsapp.net", ...], message }
  */
-export async function broadcast(req, res) {
+router.post("/broadcast", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -407,28 +396,27 @@ export async function broadcast(req, res) {
     console.error("broadcast err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * GET /wa/chats
+ * GET /chats
  */
-export async function getChats(req, res) {
+router.get("/chats", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
     if (!sock) return res.status(400).json({ error: "Session not connected" });
-
     const chats = sock.chats || [];
     res.json({ chats });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * GET /wa/messages?jid=&count=
+ * GET /messages?jid=&count=
  */
-export async function getMessages(req, res) {
+router.get("/messages", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -440,22 +428,21 @@ export async function getMessages(req, res) {
 
     if (typeof sock.fetchMessages === "function") {
       const msgs = await sock.fetchMessages(jid, count);
-      return res.json({ messages: msgs });
+      res.json({ messages: msgs });
     } else {
-      // fallback: not guaranteed; return empty array
-      return res.json({ messages: [] });
+      res.json({ messages: [] });
     }
   } catch (err) {
-    console.error("getMessages err:", err);
+    console.error("messages err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/mark-read
+ * POST /mark-read
  * body: { jid, messageId }
  */
-export async function markRead(req, res) {
+router.post("/mark-read", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -468,16 +455,15 @@ export async function markRead(req, res) {
     await saveLog(req.user.id, "mark_read", { jid, messageId });
     res.json({ success: true });
   } catch (err) {
-    console.error("markRead err:", err);
+    console.error("mark-read err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/presence
- * body: { to, presence }
+ * POST /presence  body: { to, presence }
  */
-export async function presence(req, res) {
+router.post("/presence", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -493,13 +479,12 @@ export async function presence(req, res) {
     console.error("presence err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/block  /wa/unblock
- * body: { jid }
+ * POST /block  /unblock  body: { jid }
  */
-export async function block(req, res) {
+router.post("/block", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -513,9 +498,9 @@ export async function block(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
-export async function unblock(req, res) {
+router.post("/unblock", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -529,12 +514,12 @@ export async function unblock(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * Group operations: create/add/remove/promote/demote
+ * Group operations
  */
-export async function createGroup(req, res) {
+router.post("/group-create", async (req, res) => {
   try {
     const { subject, participants } = req.body;
     const apiKey = req.user.apiKey;
@@ -548,9 +533,9 @@ export async function createGroup(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
-export async function groupAdd(req, res) {
+router.post("/group-add", async (req, res) => {
   try {
     const { groupId, participants } = req.body;
     const apiKey = req.user.apiKey;
@@ -564,9 +549,9 @@ export async function groupAdd(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
-export async function groupRemove(req, res) {
+router.post("/group-remove", async (req, res) => {
   try {
     const { groupId, participant } = req.body;
     const apiKey = req.user.apiKey;
@@ -580,9 +565,9 @@ export async function groupRemove(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
-export async function groupPromote(req, res) {
+router.post("/group-promote", async (req, res) => {
   try {
     const { groupId, participant } = req.body;
     const apiKey = req.user.apiKey;
@@ -596,9 +581,9 @@ export async function groupPromote(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
-export async function groupDemote(req, res) {
+router.post("/group-demote", async (req, res) => {
   try {
     const { groupId, participant } = req.body;
     const apiKey = req.user.apiKey;
@@ -612,29 +597,27 @@ export async function groupDemote(req, res) {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * GET /wa/contacts
+ * GET /contacts
  */
-export async function getContacts(req, res) {
+router.get("/contacts", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
     if (!sock) return res.status(400).json({ error: "Session not connected" });
-
-    const contacts = sock.contacts || {};
-    res.json({ contacts });
+    res.json({ contacts: sock.contacts || {} });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/download-media
+ * POST /download-media
  * body: { message } - full message object
  */
-export async function downloadMedia(req, res) {
+router.post("/download-media", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
@@ -643,124 +626,85 @@ export async function downloadMedia(req, res) {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "message required" });
 
-    const mediaBuffer = await sock.downloadMediaMessage(message, "buffer");
+    const buffer = await sock.downloadMediaMessage(message, "buffer");
     const mediaType = Object.keys(message.message || {}).find(k => k.includes("Message")) || "media";
-    const fileName = `${Date.now()}_${mediaType.replace("Message", "")}`;
+    const fileName = `${Date.now()}_${mediaType.replace("Message","")}`;
     if (!fs.existsSync("downloads")) fs.mkdirSync("downloads", { recursive: true });
     const filePath = path.join("downloads", fileName);
-    fs.writeFileSync(filePath, mediaBuffer);
+    fs.writeFileSync(filePath, buffer);
     await saveLog(req.user.id, "media_download", { filePath });
     res.json({ success: true, filePath });
   } catch (err) {
-    console.error("downloadMedia err:", err);
+    console.error("download-media err:", err);
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/profile-update
+ * POST /profile-update
  * body: { name }
  */
-export async function updateProfileName(req, res) {
+router.post("/profile-update", async (req, res) => {
   try {
-    const apiKey = req.user.apiKey;
-    const sock = sessions[apiKey];
-    if (!sock) return res.status(400).json({ error: "Session not connected" });
-
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
 
-    const result = await sock.updateProfileName(name).catch(()=>null);
-    await saveLog(req.user.id, "profile_update", { name });
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-}
-
-/**
- * POST /wa/profile-picture
- * body: { base64 } (image base64)
- */
-export async function updateProfilePicture(req, res) {
-  try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
     if (!sock) return res.status(400).json({ error: "Session not connected" });
 
+    await sock.updateProfileName(name).catch(()=>null);
+    await saveLog(req.user.id, "profile_update", { name });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /profile-picture
+ * body: { base64 } (image base64)
+ */
+router.post("/profile-picture", async (req, res) => {
+  try {
     const { base64 } = req.body;
     if (!base64) return res.status(400).json({ error: "base64 required" });
 
+    const apiKey = req.user.apiKey;
+    const sock = sessions[apiKey];
+    if (!sock) return res.status(400).json({ error: "Session not connected" });
+
     const buffer = Buffer.from(base64, "base64");
-    // Baileys API has different method names depending on version; attempt updateProfilePicture
-    try {
-      await sock.updateProfilePicture(req.user.apiKey + "@s.whatsapp.net", buffer);
-    } catch (e) {
-      // ignore if not available
-    }
+    try { await sock.updateProfilePicture(req.user.apiKey + "@s.whatsapp.net", buffer); } catch {}
     await saveLog(req.user.id, "profile_picture_update", {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /**
- * POST /wa/logout
+ * POST /logout
  */
-export async function logout(req, res) {
+router.post("/logout", async (req, res) => {
   try {
     const apiKey = req.user.apiKey;
     const sock = sessions[apiKey];
     if (sock) {
-      try { await sock.logout(); } catch (e) {}
+      try { await sock.logout(); } catch {}
       delete sessions[apiKey];
     }
     const sessDir = path.join("baileys", "sessions", apiKey);
     try { fs.rmSync(sessDir, { recursive: true, force: true }); } catch {}
-    // notify SSE clients
     sendSSE(apiKey, "logged_out", {});
     await saveLog(req.user.id, "logout", {});
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+});
 
 /* ----------------------------
-   Router helper to export all routes
+   Export router and helpers
    ---------------------------- */
-import express from "express";
-const router = express.Router();
-
-// SSE QR stream (client must connect with x-api-key header or ?apiKey=)
-router.get("/qr-stream", qrSSE);
-
-// main actions
-router.post("/connect", async (req, res, next) => connect(req, res).catch(next));
-router.get("/status", async (req, res, next) => status(req, res).catch(next));
-router.post("/send-text", async (req, res, next) => sendText(req, res).catch(next));
-router.post("/send-media", async (req, res, next) => sendMedia(req, res).catch(next));
-router.post("/send-buttons", async (req, res, next) => sendButtons(req, res).catch(next));
-router.post("/send-template", async (req, res, next) => sendTemplate(req, res).catch(next));
-router.post("/broadcast", async (req, res, next) => broadcast(req, res).catch(next));
-router.get("/chats", async (req, res, next) => getChats(req, res).catch(next));
-router.get("/messages", async (req, res, next) => getMessages(req, res).catch(next));
-router.post("/mark-read", async (req, res, next) => markRead(req, res).catch(next));
-router.post("/presence", async (req, res, next) => presence(req, res).catch(next));
-router.post("/block", async (req, res, next) => block(req, res).catch(next));
-router.post("/unblock", async (req, res, next) => unblock(req, res).catch(next));
-router.post("/group-create", async (req, res, next) => createGroup(req, res).catch(next));
-router.post("/group-add", async (req, res, next) => groupAdd(req, res).catch(next));
-router.post("/group-remove", async (req, res, next) => groupRemove(req, res).catch(next));
-router.post("/group-promote", async (req, res, next) => groupPromote(req, res).catch(next));
-router.post("/group-demote", async (req, res, next) => groupDemote(req, res).catch(next));
-router.get("/contacts", async (req, res, next) => getContacts(req, res).catch(next));
-router.post("/download-media", async (req, res, next) => downloadMedia(req, res).catch(next));
-router.post("/profile-update", async (req, res, next) => updateProfileName(req, res).catch(next));
-router.post("/profile-picture", async (req, res, next) => updateProfilePicture(req, res).catch(next));
-router.post("/logout", async (req, res, next) => logout(req, res).catch(next));
-
-// Export router and helpers for app to mount at e.g. /api/wa
-export { createSocketForUser };
 export default router;
